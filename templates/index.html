@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GetGitMergeInfo</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Public+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#F6F4EE;
+    --panel:#FFFFFF;
+    --ink:#1C1E21;
+    --ink-soft:#5B5F66;
+    --line:#DEDACB;
+    --teal:#1F6F78;
+    --teal-deep:#154F56;
+    --mustard:#C98A2C;
+    --rust:#A6412A;
+    --rust-bg:#F6E7E2;
+    --radius:3px;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:'Public Sans', sans-serif;
+    font-size:15px;
+    line-height:1.5;
+  }
+  code, .mono, input, textarea, .commit, .path{
+    font-family:'IBM Plex Mono', monospace;
+  }
+
+  .shell{
+    display:grid;
+    grid-template-columns:56px minmax(0,1fr);
+    max-width:1180px;
+    margin:0 auto;
+    min-height:100vh;
+  }
+
+  /* graph rail */
+  .rail{
+    position:relative;
+    border-right:1px solid var(--line);
+  }
+  .rail::before{
+    content:"";
+    position:absolute;
+    left:27px;
+    top:0;
+    bottom:0;
+    width:2px;
+    background:var(--line);
+  }
+  .rail .node{
+    position:absolute;
+    left:20px;
+    width:16px;
+    height:16px;
+    border-radius:50%;
+    border:2px solid var(--paper);
+  }
+
+  main{padding:40px 40px 80px;}
+
+  header.top{
+    display:flex;
+    align-items:baseline;
+    gap:14px;
+    margin-bottom:6px;
+  }
+  header.top h1{
+    font-size:22px;
+    margin:0;
+    letter-spacing:-0.01em;
+  }
+  header.top .tag{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:12.5px;
+    color:var(--ink-soft);
+  }
+  p.lede{
+    margin:0 0 36px;
+    color:var(--ink-soft);
+    max-width:62ch;
+  }
+
+  section{margin-bottom:36px;}
+  h2{
+    font-size:12.5px;
+    text-transform:none;
+    letter-spacing:0.02em;
+    color:var(--ink-soft);
+    margin:0 0 14px;
+    font-weight:600;
+  }
+
+  .panel{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    padding:22px 24px;
+  }
+
+  label{
+    display:block;
+    font-size:13px;
+    font-weight:600;
+    margin-bottom:6px;
+  }
+  .hint{
+    font-size:12.5px;
+    color:var(--ink-soft);
+    margin:4px 0 0;
+  }
+  .field{margin-bottom:18px;}
+  .field:last-child{margin-bottom:0;}
+
+  input[type=text], textarea{
+    width:100%;
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    padding:9px 11px;
+    font-size:13.5px;
+    background:#FCFBF8;
+    color:var(--ink);
+  }
+  input[type=text]:focus, textarea:focus{
+    outline:2px solid var(--teal);
+    outline-offset:1px;
+    border-color:var(--teal);
+  }
+  textarea{
+    min-height:110px;
+    resize:vertical;
+  }
+
+  .row2{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:18px;
+  }
+  @media (max-width:640px){ .row2{grid-template-columns:1fr;} }
+
+  .checkline{
+    display:flex;
+    align-items:flex-start;
+    gap:9px;
+    margin-top:10px;
+    font-size:13px;
+    color:var(--ink-soft);
+  }
+  .checkline input{margin-top:3px;}
+  .checkline.danger{color:var(--rust);}
+
+  button.run{
+    appearance:none;
+    border:none;
+    background:var(--teal);
+    color:#fff;
+    font-family:'Public Sans', sans-serif;
+    font-weight:600;
+    font-size:14px;
+    padding:11px 20px;
+    border-radius:var(--radius);
+    cursor:pointer;
+    margin-top:20px;
+  }
+  button.run:hover{background:var(--teal-deep);}
+  button.run:disabled{background:#9CA3A6;cursor:progress;}
+
+  button.ghost{
+    appearance:none;
+    border:1px solid var(--line);
+    background:transparent;
+    color:var(--ink);
+    font-family:'Public Sans', sans-serif;
+    font-weight:600;
+    font-size:13px;
+    padding:8px 14px;
+    border-radius:var(--radius);
+    cursor:pointer;
+  }
+  button.ghost:hover{border-color:var(--ink-soft);}
+
+  .error-banner{
+    display:none;
+    background:var(--rust-bg);
+    border:1px solid var(--rust);
+    color:var(--rust);
+    border-radius:var(--radius);
+    padding:12px 14px;
+    font-size:13.5px;
+    margin-bottom:18px;
+  }
+
+  #log{
+    display:none;
+    font-size:12.5px;
+    color:var(--ink-soft);
+    background:#FCFBF8;
+    border:1px solid var(--line);
+    border-radius:var(--radius);
+    padding:12px 14px;
+    max-height:150px;
+    overflow-y:auto;
+    white-space:pre-wrap;
+  }
+
+  .results-head{
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    margin-bottom:14px;
+  }
+
+  table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:13px;
+    background:var(--panel);
+  }
+  thead th{
+    text-align:left;
+    font-size:11.5px;
+    color:var(--ink-soft);
+    font-weight:600;
+    padding:0 10px 8px;
+    border-bottom:1px solid var(--line);
+    white-space:nowrap;
+  }
+  tbody td{
+    padding:10px;
+    border-bottom:1px solid var(--line);
+    vertical-align:top;
+  }
+  tbody tr:last-child td{border-bottom:none;}
+  tbody tr.error-row{background:var(--rust-bg);}
+  tbody tr.error-row td{color:var(--rust);}
+
+  .dot{
+    display:inline-block;
+    width:9px;height:9px;
+    border-radius:50%;
+    margin-right:7px;
+    position:relative;top:-1px;
+  }
+  .dot.ok{background:var(--teal);}
+  .dot.err{background:var(--rust);}
+
+  .commit{font-size:12px;color:var(--ink-soft);}
+  .branch-tag{
+    display:inline-block;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:11.5px;
+    background:#EFEAD9;
+    border:1px solid var(--line);
+    color:var(--ink);
+    padding:1px 6px;
+    border-radius:2px;
+  }
+  .muted{color:var(--ink-soft);}
+  details summary{cursor:pointer;color:var(--teal);font-size:12px;}
+  details[open] summary{color:var(--teal-deep);}
+  .branch-merges-list{
+    margin:6px 0 0;
+    padding-left:16px;
+    font-size:12px;
+    color:var(--ink-soft);
+  }
+
+  .empty-state{
+    color:var(--ink-soft);
+    font-size:13.5px;
+    padding:18px 0;
+  }
+
+  footer{
+    margin-top:50px;
+    font-size:12px;
+    color:var(--ink-soft);
+    border-top:1px solid var(--line);
+    padding-top:16px;
+  }
+  footer code{background:#EFEAD9;padding:1px 5px;border-radius:2px;}
+</style>
+</head>
+<body>
+<div class="shell">
+  <div class="rail" aria-hidden="true">
+    <div class="node" style="top:52px;background:var(--teal);"></div>
+    <div class="node" style="top:220px;background:var(--mustard);"></div>
+    <div class="node" style="top:420px;background:var(--teal);"></div>
+  </div>
+
+  <main>
+    <header class="top">
+      <h1>GetGitMergeInfo</h1>
+      <span class="tag">local &middot; read-only by default</span>
+    </header>
+    <p class="lede">
+      Point this at a git repo on this machine, list the file names you care about,
+      and get the last merge that touched each one &mdash; who merged it, who actually
+      wrote the code, and every other merge of that same branch.
+    </p>
+
+    <section>
+      <h2>Repository</h2>
+      <div class="panel">
+        <form id="run-form">
+          <div class="row2">
+            <div class="field">
+              <label for="repo_path">Repo path</label>
+              <input type="text" id="repo_path" placeholder="/Users/you/projects/my-repo" required>
+              <p class="hint">Local path to the one repository to search. No credentials needed &mdash; this never talks to a remote.</p>
+            </div>
+            <div class="field">
+              <label for="branch">Branch <span class="muted" style="font-weight:400;">(optional)</span></label>
+              <input type="text" id="branch" placeholder="main">
+              <p class="hint">Leave blank to read the repo exactly as it sits on disk.</p>
+            </div>
+          </div>
+
+          <div class="checkline danger" id="reset-line" style="display:none;">
+            <input type="checkbox" id="confirm_reset">
+            <label for="confirm_reset" style="margin:0;font-weight:400;">
+              Hard-reset the working tree to <span class="mono" id="reset-branch-name">this branch</span> before searching.
+              This discards any uncommitted local changes in the repo &mdash; leave unchecked to read the repo as-is.
+            </label>
+          </div>
+
+          <div class="field" style="margin-top:20px;">
+            <label for="file_names">File names <span class="muted" style="font-weight:400;">(one per line, bare names &mdash; not full paths)</span></label>
+            <textarea id="file_names" placeholder="config.py&#10;utils.py&#10;README.md" required></textarea>
+          </div>
+
+          <button type="submit" class="run" id="run-btn">Find merge info</button>
+        </form>
+      </div>
+    </section>
+
+    <div class="error-banner" id="error-banner"></div>
+    <div id="log"></div>
+
+    <section id="results-section" style="display:none;">
+      <div class="results-head">
+        <h2 style="margin:0;">Results</h2>
+        <button class="ghost" id="download-btn">Download output.csv</button>
+      </div>
+      <div class="panel" style="padding:0;overflow-x:auto;">
+        <table id="results-table">
+          <thead>
+            <tr>
+              <th></th>
+              <th>File</th>
+              <th>Merge owner</th>
+              <th>Pushed by</th>
+              <th>Merge message</th>
+              <th>Branch</th>
+              <th>Commit</th>
+              <th>Merged at</th>
+              <th>Other merges of this branch</th>
+            </tr>
+          </thead>
+          <tbody id="results-body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>
+      Reads git history only &mdash; the same rules as the original CLI script: <code>--merges --full-history</code> so
+      clean, non-conflicting merges aren't hidden by git's default path simplification.
+    </footer>
+  </main>
+</div>
+
+<script>
+const form = document.getElementById('run-form');
+const runBtn = document.getElementById('run-btn');
+const errorBanner = document.getElementById('error-banner');
+const logBox = document.getElementById('log');
+const resultsSection = document.getElementById('results-section');
+const resultsBody = document.getElementById('results-body');
+const downloadBtn = document.getElementById('download-btn');
+const branchInput = document.getElementById('branch');
+const resetLine = document.getElementById('reset-line');
+const resetBranchName = document.getElementById('reset-branch-name');
+const confirmReset = document.getElementById('confirm_reset');
+
+let lastRows = [];
+
+branchInput.addEventListener('input', () => {
+  const v = branchInput.value.trim();
+  resetLine.style.display = v ? 'flex' : 'none';
+  if (!v) confirmReset.checked = false;
+  resetBranchName.textContent = v || 'this branch';
+});
+
+function escapeHtml(s){
+  return (s ?? '').toString()
+    .replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;');
+}
+
+function renderRows(rows){
+  resultsBody.innerHTML = '';
+  if (rows.length === 0){
+    resultsSection.style.display = 'block';
+    resultsBody.innerHTML = `<tr><td colspan="9" class="empty-state">No files processed.</td></tr>`;
+    return;
+  }
+  for (const row of rows){
+    const isError = (row.merge_message || '').startsWith('ERROR:');
+    const tr = document.createElement('tr');
+    tr.className = isError ? 'error-row' : '';
+
+    const branchMerges = (row.branch_merges || '')
+      .split(';').map(s => s.trim()).filter(Boolean);
+
+    tr.innerHTML = `
+      <td><span class="dot ${isError ? 'err' : 'ok'}"></span></td>
+      <td>
+        <div class="path">${escapeHtml(row.file_name)}</div>
+        ${row.resolved_path ? `<div class="muted" style="font-size:11.5px;">${escapeHtml(row.resolved_path)}</div>` : ''}
+      </td>
+      <td>${escapeHtml(row.merge_owner) || '&mdash;'}</td>
+      <td>
+        ${row.pushed_by ? escapeHtml(row.pushed_by) : '&mdash;'}
+        ${row.pushed_by_email ? `<div class="muted" style="font-size:11.5px;">${escapeHtml(row.pushed_by_email)}</div>` : ''}
+      </td>
+      <td style="max-width:260px;">${escapeHtml(row.merge_message) || '&mdash;'}</td>
+      <td>${row.merged_branch ? `<span class="branch-tag">${escapeHtml(row.merged_branch)}</span>` : '&mdash;'}</td>
+      <td class="commit">${row.merge_commit ? row.merge_commit.slice(0,10) : '&mdash;'}</td>
+      <td class="muted" style="font-size:12px;">${row.merged_at ? escapeHtml(row.merged_at) : '&mdash;'}</td>
+      <td>
+        ${branchMerges.length > 1
+          ? `<details><summary>${branchMerges.length} merges</summary>
+              <ul class="branch-merges-list">${branchMerges.map(e => `<li class="commit">${escapeHtml(e)}</li>`).join('')}</ul>
+             </details>`
+          : (branchMerges[0] ? `<span class="commit">${escapeHtml(branchMerges[0])}</span>` : '&mdash;')}
+      </td>
+    `;
+    resultsBody.appendChild(tr);
+  }
+  resultsSection.style.display = 'block';
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  errorBanner.style.display = 'none';
+  logBox.style.display = 'none';
+  runBtn.disabled = true;
+  runBtn.textContent = 'Searching...';
+
+  const payload = {
+    repo_path: document.getElementById('repo_path').value.trim(),
+    branch: branchInput.value.trim(),
+    confirm_reset: confirmReset.checked,
+    file_names: document.getElementById('file_names').value,
+  };
+
+  try {
+    const res = await fetch('/api/run', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok){
+      errorBanner.textContent = data.error || 'Something went wrong.';
+      errorBanner.style.display = 'block';
+      return;
+    }
+    lastRows = data.rows;
+    logBox.textContent = (data.log || []).join('\n');
+    logBox.style.display = 'block';
+    renderRows(lastRows);
+  } catch (err){
+    errorBanner.textContent = 'Could not reach the server: ' + err.message;
+    errorBanner.style.display = 'block';
+  } finally {
+    runBtn.disabled = false;
+    runBtn.textContent = 'Find merge info';
+  }
+});
+
+downloadBtn.addEventListener('click', async () => {
+  const res = await fetch('/api/download', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({rows: lastRows}),
+  });
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'output.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+});
+</script>
+</body>
+</html>
