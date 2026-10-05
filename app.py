@@ -10,11 +10,16 @@ in the browser, paste in file names, and get an interactive results table
 and still runs 100% locally against the repo path you give it - nothing is
 sent anywhere over the network.
 
+CHANGE: if a file name exists in several folders of the repo, merge info is
+now returned for EVERY location (one result row per location) instead of
+raising an "ambiguous" error.
+
 Run:
     pip install -r requirements.txt
     python app.py
 Then open http://127.0.0.1:5000
 """
+
 import csv
 import io
 import os
@@ -32,7 +37,7 @@ BRANCH_MERGE_RE = re.compile(r"Merge branch '([^']+)'")
 
 
 # --------------------------------------------------------------------------
-# Core git logic (ported as-is from get_last_merge_info.py)
+# Core git logic (ported from get_last_merge_info.py)
 # --------------------------------------------------------------------------
 
 def run_git(repo_path, args, check=True):
@@ -60,20 +65,18 @@ def hard_reset_to_branch(repo_path, branch):
     run_git(repo_path, ["reset", "--hard", branch])
 
 
-def find_file_in_repo(repo_path, file_name):
-    """Search repo_path for a file named file_name (excluding .git internals).
-    Returns (relative_path_or_None, list_of_all_relative_matches)."""
+def find_all_files_in_repo(repo_path, file_name):
+    """Search repo_path for every file named file_name (excluding .git
+    internals). Returns a sorted list of repo-relative paths (possibly empty)."""
     matches = []
     for dirpath, dirnames, filenames in os.walk(repo_path):
         if ".git" in dirnames:
             dirnames.remove(".git")
         if file_name in filenames:
             full_path = os.path.join(dirpath, file_name)
-            rel_path = os.path.relpath(full_path, repo_path)
-            matches.append(rel_path)
-    if len(matches) == 1:
-        return matches[0], matches
-    return None, matches
+            matches.append(os.path.relpath(full_path, repo_path))
+    matches.sort()
+    return matches
 
 
 def get_pushed_by(repo_path, merge_commit_hash):
@@ -171,18 +174,39 @@ ROW_FIELDS = [
 ]
 
 
-def blank_row(file_name, error):
+def blank_row(file_name, error, resolved_path=""):
     row = {k: "" for k in ROW_FIELDS}
     row["file_name"] = file_name
+    row["resolved_path"] = resolved_path
     row["merge_message"] = f"ERROR: {error}"
+    return row
+
+
+def build_row_for_path(repo_path, file_name, rel_path, branch_merges_cache):
+    """Builds one result row for a single resolved location of a file."""
+    row = {"file_name": file_name, "resolved_path": rel_path}
+    try:
+        info = get_last_merge_info_for_file(repo_path, rel_path)
+        if "error" in info:
+            return blank_row(file_name, info["error"], rel_path)
+        row.update(info)
+        row["branch_merges"] = get_all_merges_for_branch(
+            repo_path, info["merged_branch"], branch_merges_cache
+        )
+    except Exception as e:  # noqa: BLE001 - surface any git error into the row
+        return blank_row(file_name, str(e), rel_path)
+    for k in ROW_FIELDS:
+        row.setdefault(k, "")
     return row
 
 
 def process(repo_path, branch, do_reset, file_names):
     """Runs the same pipeline as the CLI script's main(), but returns rows
-    (list of dicts) plus a log of what happened instead of writing files."""
-    log = []
+    (list of dicts) plus a log of what happened instead of writing files.
 
+    If a file name is found in multiple locations, one row is produced for
+    each location (same file_name, different resolved_path)."""
+    log = []
     validate_repo(repo_path)
 
     if branch and do_reset:
@@ -199,34 +223,24 @@ def process(repo_path, branch, do_reset, file_names):
 
     for file_name in file_names:
         log.append(f"Searching for '{file_name}'...")
-        rel_path, matches = find_file_in_repo(repo_path, file_name)
+        matches = find_all_files_in_repo(repo_path, file_name)
 
-        if rel_path is None:
-            if not matches:
-                err = f"file '{file_name}' not found in repo"
-            else:
-                err = f"ambiguous: found {len(matches)} files named '{file_name}': {matches}"
-            rows.append(blank_row(file_name, err))
+        if not matches:
+            rows.append(blank_row(file_name, f"file '{file_name}' not found in repo"))
+            log.append(f"  '{file_name}' not found.")
             continue
 
-        row = {"file_name": file_name, "resolved_path": rel_path}
-        try:
-            info = get_last_merge_info_for_file(repo_path, rel_path)
-            if "error" in info:
-                row.update({k: "" for k in ROW_FIELDS if k not in row})
-                row["merge_message"] = f"ERROR: {info['error']}"
-            else:
-                row.update(info)
-                row["branch_merges"] = get_all_merges_for_branch(
-                    repo_path, info["merged_branch"], branch_merges_cache
-                )
-        except Exception as e:  # noqa: BLE001 - surface any git error into the row
-            row.update({k: "" for k in ROW_FIELDS if k not in row})
-            row["merge_message"] = f"ERROR: {e}"
+        if len(matches) > 1:
+            log.append(f"  Found {len(matches)} locations for '{file_name}':")
+            for p in matches:
+                log.append(f"    - {p}")
+        else:
+            log.append(f"  Found at {matches[0]}")
 
-        rows.append(row)
+        for rel_path in matches:
+            rows.append(build_row_for_path(repo_path, file_name, rel_path, branch_merges_cache))
 
-    log.append(f"Done. Processed {len(rows)} file(s).")
+    log.append(f"Done. Processed {len(file_names)} file name(s) -> {len(rows)} result row(s).")
     return rows, log
 
 
@@ -246,7 +260,6 @@ def api_run():
     branch = (data.get("branch") or "").strip()
     do_reset = bool(data.get("confirm_reset"))
     raw_files = data.get("file_names") or ""
-
     file_names = [line.strip() for line in raw_files.splitlines() if line.strip()]
 
     if not file_names:
