@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """
-GetGitMergeInfo - UI edition
-============================
-A local web UI over the original get_last_merge_info.py logic.
+GetGitMergeInfo - UI edition (optimized)
+========================================
+Local web UI over the original get_last_merge_info.py logic. Everything runs
+locally against the repo path you give it.
 
-Instead of input.csv / git_login.json / output.csv, you point this at a repo
-in the browser, paste in file names, and get an interactive results table
-(with CSV export). All git interaction is unchanged from the original script
-and still runs 100% locally against the repo path you give it - nothing is
-sent anywhere over the network.
+If a file name exists in several folders, merge info is returned for EVERY
+location (one result row per location).
 
-CHANGE: if a file name exists in several folders of the repo, merge info is
-now returned for EVERY location (one result row per location) instead of
-raising an "ambiguous" error.
+Performance notes (vs. the previous version)
+--------------------------------------------
+* Files are located with ONE `git ls-files` call, indexed by file name,
+  instead of an os.walk of the whole working tree per file name.
+* The "all merges of the same branch" lookup runs ONE `git log --merges --all`
+  for the whole request and is indexed by branch, instead of one full-history
+  scan per distinct branch.
+* The merge-commit lookup returns parent hashes in the same call, saving one
+  git invocation per location; "pushed by" lookups are cached per commit.
+* Per-location git lookups run in a small thread pool (they're subprocess
+  bound), with results kept in input order.
+* Duplicate file names in the input are processed once.
 
 Run:
     pip install -r requirements.txt
     python app.py
 Then open http://127.0.0.1:5000
+(Set FLASK_DEBUG=1 if you want the Werkzeug debugger; it is off by default.)
 """
 
 import csv
@@ -25,19 +33,28 @@ import io
 import os
 import re
 import subprocess
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 from flask import Flask, jsonify, render_template, request, Response
 
 app = Flask(__name__)
 
-# Matches: "Merge pull request #123 from owner/branch-name"
+MAX_WORKERS = 8
+
+# "Merge pull request #123 from owner/branch-name"
 PR_MERGE_RE = re.compile(r"Merge pull request #\d+ from ([^\s/]+)/(\S+)")
-# Matches: "Merge branch 'branch-name' into target" (or without "into target")
+# "Merge branch 'branch-name' into target"
 BRANCH_MERGE_RE = re.compile(r"Merge branch '([^']+)'")
+
+ROW_FIELDS = [
+    "file_name", "resolved_path", "merge_owner", "pushed_by", "pushed_by_email",
+    "merge_message", "merged_branch", "merge_commit", "merged_at", "branch_merges",
+]
 
 
 # --------------------------------------------------------------------------
-# Core git logic (ported from get_last_merge_info.py)
+# Git helpers
 # --------------------------------------------------------------------------
 
 def run_git(repo_path, args, check=True):
@@ -45,6 +62,8 @@ def run_git(repo_path, args, check=True):
         ["git", "-C", repo_path] + args,
         capture_output=True,
         text=True,
+        encoding="utf-8",
+        errors="replace",
     )
     if check and result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip()}")
@@ -54,77 +73,79 @@ def run_git(repo_path, args, check=True):
 def validate_repo(repo_path):
     if not repo_path or not os.path.isdir(repo_path):
         raise ValueError(f"'{repo_path}' is not a directory that exists on this machine")
-    if not os.path.isdir(os.path.join(repo_path, ".git")):
-        raise ValueError(f"'{repo_path}' does not look like a git repository (no .git folder)")
+    # rev-parse (rather than checking for a .git folder) also accepts
+    # worktrees and submodules, where .git is a file.
+    out = run_git(repo_path, ["rev-parse", "--is-inside-work-tree"], check=False)
+    if out != "true":
+        raise ValueError(f"'{repo_path}' does not look like a git repository")
 
 
 def hard_reset_to_branch(repo_path, branch):
-    """Checks out the given branch and hard-resets the working tree to it,
-    discarding any local changes/commits that aren't on that branch tip."""
-    run_git(repo_path, ["checkout", branch])
-    run_git(repo_path, ["reset", "--hard", branch])
+    """Checks out the branch and hard-resets the working tree to it,
+    discarding local changes. Destructive - only runs when confirmed."""
+    if branch.startswith("-"):
+        raise ValueError(f"invalid branch name '{branch}'")
+    run_git(repo_path, ["checkout", branch, "--"])
+    run_git(repo_path, ["reset", "--hard", branch, "--"])
 
 
-def find_all_files_in_repo(repo_path, file_name):
-    """Search repo_path for every file named file_name (excluding .git
-    internals). Returns a sorted list of repo-relative paths (possibly empty)."""
-    matches = []
-    for dirpath, dirnames, filenames in os.walk(repo_path):
-        if ".git" in dirnames:
-            dirnames.remove(".git")
-        if file_name in filenames:
-            full_path = os.path.join(dirpath, file_name)
-            matches.append(os.path.relpath(full_path, repo_path))
-    matches.sort()
-    return matches
-
-
-def get_pushed_by(repo_path, merge_commit_hash):
-    """The merge commit's author is whoever performed the merge (often a
-    maintainer or a bot), not necessarily who wrote the code. The actual dev
-    who pushed the changes is the author of the tip commit on the branch that
-    got merged in - i.e. the merge commit's second parent. Falls back to the
-    merge commit's own author if there's no second parent."""
-    parents = run_git(repo_path, ["log", "-1", "--pretty=format:%P", merge_commit_hash], check=False)
-    parent_hashes = parents.split()
-    target_commit = parent_hashes[1] if len(parent_hashes) >= 2 else merge_commit_hash
-    info = run_git(repo_path, ["log", "-1", "--pretty=format:%an%x01%ae", target_commit], check=False)
-    name, _, email = info.partition("\x01")
-    return name, email
-
-
-def get_last_merge_info_for_file(repo_path, rel_file_path):
-    """Find the most recent merge commit that touched rel_file_path and parse
-    owner/message/branch from it. Uses --full-history alongside --merges
-    because git's default path-based history simplification hides merge
-    commits whose result is identical to one parent."""
-    log_format = "%H%x01%an%x01%s%x01%cI"
-    output = run_git(
-        repo_path,
-        ["log", "--merges", "--full-history", "-1", f"--pretty=format:{log_format}", "--", rel_file_path],
-        check=False,
-    )
-    if not output:
-        return {"error": "no merge commit found that touched this file"}
-
-    commit_hash, author, subject, committed_at = output.split("\x01")
-
-    merged_branch = ""
-    pr_owner = None
+def parse_merge_subject(subject):
+    """Returns (pr_owner_or_None, branch_or_'')."""
     m = PR_MERGE_RE.search(subject)
     if m:
-        pr_owner, merged_branch = m.group(1), m.group(2)
-    else:
-        m = BRANCH_MERGE_RE.search(subject)
-        if m:
-            merged_branch = m.group(1)
+        return m.group(1), m.group(2)
+    m = BRANCH_MERGE_RE.search(subject)
+    if m:
+        return None, m.group(1)
+    return None, ""
 
-    pushed_by_name, pushed_by_email = get_pushed_by(repo_path, commit_hash)
+
+def index_repo_files(repo_path):
+    """One `git ls-files` call -> {file_name: [sorted repo-relative paths]}.
+    Only tracked files are indexed (untracked/ignored files can't have merge
+    history anyway, and this skips things like node_modules copies)."""
+    out = run_git(repo_path, ["-c", "core.quotepath=off", "ls-files", "-z"], check=False)
+    index = defaultdict(list)
+    for path in out.split("\0"):
+        if path:
+            index[path.rsplit("/", 1)[-1]].append(path)
+    for paths in index.values():
+        paths.sort()
+    return index
+
+
+def get_pushed_by(repo_path, merge_commit, parents, cache):
+    """Author of the merge's second parent (the tip of the merged branch);
+    falls back to the merge commit itself. Cached per target commit."""
+    target = parents[1] if len(parents) >= 2 else merge_commit
+    if target not in cache:
+        info = run_git(repo_path, ["log", "-1", "--pretty=format:%an%x01%ae", target], check=False)
+        name, _, email = info.partition("\x01")
+        cache[target] = (name, email)
+    return cache[target]
+
+
+def get_last_merge_info_for_file(repo_path, rel_path, pushed_by_cache):
+    """Most recent merge commit touching rel_path. --full-history is needed
+    alongside --merges because default history simplification hides merges
+    whose result equals one parent."""
+    fmt = "%H%x01%an%x01%s%x01%cI%x01%P"
+    out = run_git(
+        repo_path,
+        ["log", "--merges", "--full-history", "-1", f"--pretty=format:{fmt}", "--", rel_path],
+        check=False,
+    )
+    if not out:
+        return {"error": "no merge commit found that touched this file"}
+
+    commit_hash, author, subject, committed_at, parents = out.split("\x01")
+    pr_owner, merged_branch = parse_merge_subject(subject)
+    name, email = get_pushed_by(repo_path, commit_hash, parents.split(), pushed_by_cache)
 
     return {
         "merge_owner": pr_owner or author,
-        "pushed_by": pushed_by_name,
-        "pushed_by_email": pushed_by_email,
+        "pushed_by": name,
+        "pushed_by_email": email,
         "merge_message": subject,
         "merged_branch": merged_branch,
         "merge_commit": commit_hash,
@@ -132,47 +153,24 @@ def get_last_merge_info_for_file(repo_path, rel_file_path):
     }
 
 
-def get_all_merges_for_branch(repo_path, branch_name, cache):
-    """Find every merge commit anywhere in the repo's history whose subject
-    references branch_name, not just the most recent one. Cached per branch."""
-    if not branch_name:
-        return ""
-    if branch_name in cache:
-        return cache[branch_name]
-
-    log_format = "%H%x01%s%x01%cI"
-    output = run_git(repo_path, ["log", "--merges", "--all", f"--pretty=format:{log_format}"], check=False)
-
-    entries = []
-    if output:
-        for line in output.split("\n"):
-            if not line:
-                continue
-            parts = line.split("\x01")
-            if len(parts) != 3:
-                continue
-            commit_hash, subject, committed_at = parts
-            matched_branch = None
-            m = PR_MERGE_RE.search(subject)
-            if m:
-                matched_branch = m.group(2)
-            else:
-                m = BRANCH_MERGE_RE.search(subject)
-                if m:
-                    matched_branch = m.group(1)
-            if matched_branch == branch_name:
-                entries.append(f"{commit_hash[:8]} ({committed_at})")
-
-    result = "; ".join(entries)
-    cache[branch_name] = result
-    return result
+def build_branch_merge_index(repo_path):
+    """ONE scan of every merge commit in the repo -> {branch: "hash8 (date); ..."}."""
+    out = run_git(repo_path, ["log", "--merges", "--all", "--pretty=format:%H%x01%s%x01%cI"], check=False)
+    entries = defaultdict(list)
+    for line in out.split("\n"):
+        parts = line.split("\x01")
+        if len(parts) != 3:
+            continue
+        commit_hash, subject, committed_at = parts
+        _, branch = parse_merge_subject(subject)
+        if branch:
+            entries[branch].append(f"{commit_hash[:8]} ({committed_at})")
+    return {b: "; ".join(v) for b, v in entries.items()}
 
 
-ROW_FIELDS = [
-    "file_name", "resolved_path", "merge_owner", "pushed_by", "pushed_by_email",
-    "merge_message", "merged_branch", "merge_commit", "merged_at", "branch_merges",
-]
-
+# --------------------------------------------------------------------------
+# Row building / pipeline
+# --------------------------------------------------------------------------
 
 def blank_row(file_name, error, resolved_path=""):
     row = {k: "" for k in ROW_FIELDS}
@@ -182,30 +180,21 @@ def blank_row(file_name, error, resolved_path=""):
     return row
 
 
-def build_row_for_path(repo_path, file_name, rel_path, branch_merges_cache):
-    """Builds one result row for a single resolved location of a file."""
-    row = {"file_name": file_name, "resolved_path": rel_path}
+def build_row_for_path(repo_path, file_name, rel_path, pushed_by_cache):
     try:
-        info = get_last_merge_info_for_file(repo_path, rel_path)
-        if "error" in info:
-            return blank_row(file_name, info["error"], rel_path)
-        row.update(info)
-        row["branch_merges"] = get_all_merges_for_branch(
-            repo_path, info["merged_branch"], branch_merges_cache
-        )
+        info = get_last_merge_info_for_file(repo_path, rel_path, pushed_by_cache)
     except Exception as e:  # noqa: BLE001 - surface any git error into the row
         return blank_row(file_name, str(e), rel_path)
-    for k in ROW_FIELDS:
-        row.setdefault(k, "")
+    if "error" in info:
+        return blank_row(file_name, info["error"], rel_path)
+    row = {k: "" for k in ROW_FIELDS}
+    row.update(info)
+    row["file_name"] = file_name
+    row["resolved_path"] = rel_path
     return row
 
 
 def process(repo_path, branch, do_reset, file_names):
-    """Runs the same pipeline as the CLI script's main(), but returns rows
-    (list of dicts) plus a log of what happened instead of writing files.
-
-    If a file name is found in multiple locations, one row is produced for
-    each location (same file_name, different resolved_path)."""
     log = []
     validate_repo(repo_path)
 
@@ -213,32 +202,47 @@ def process(repo_path, branch, do_reset, file_names):
         log.append(f"Hard-resetting {repo_path} to branch '{branch}'...")
         hard_reset_to_branch(repo_path, branch)
         log.append(f"Done. Working tree now matches '{branch}'.")
-    elif branch and not do_reset:
+    elif branch:
         log.append(f"Branch '{branch}' set but reset not confirmed - reading repo as-is on disk.")
     else:
         log.append("No branch given - reading repo exactly as it currently sits on disk.")
 
-    rows = []
-    branch_merges_cache = {}
+    # De-duplicate names, keep input order.
+    file_names = list(dict.fromkeys(file_names))
 
-    for file_name in file_names:
-        log.append(f"Searching for '{file_name}'...")
-        matches = find_all_files_in_repo(repo_path, file_name)
+    file_index = index_repo_files(repo_path)
 
+    # Plan: a list of slots in output order; each is either a ready row or a
+    # (file_name, rel_path) job to run.
+    slots = []
+    for name in file_names:
+        matches = file_index.get(name, [])
+        log.append(f"Searching for '{name}'...")
         if not matches:
-            rows.append(blank_row(file_name, f"file '{file_name}' not found in repo"))
-            log.append(f"  '{file_name}' not found.")
+            slots.append(blank_row(name, f"file '{name}' not found in repo"))
+            log.append(f"  '{name}' not found.")
             continue
-
         if len(matches) > 1:
-            log.append(f"  Found {len(matches)} locations for '{file_name}':")
-            for p in matches:
-                log.append(f"    - {p}")
+            log.append(f"  Found {len(matches)} locations for '{name}':")
+            log.extend(f"    - {p}" for p in matches)
         else:
             log.append(f"  Found at {matches[0]}")
+        slots.extend((name, p) for p in matches)
 
-        for rel_path in matches:
-            rows.append(build_row_for_path(repo_path, file_name, rel_path, branch_merges_cache))
+    jobs = [s for s in slots if isinstance(s, tuple)]
+    pushed_by_cache = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        results = iter(pool.map(
+            lambda j: build_row_for_path(repo_path, j[0], j[1], pushed_by_cache), jobs
+        ))
+    rows = [next(results) if isinstance(s, tuple) else s for s in slots]
+
+    # Fill branch_merges from a single repo-wide scan, only if needed.
+    if any(r["merged_branch"] for r in rows):
+        branch_index = build_branch_merge_index(repo_path)
+        for r in rows:
+            if r["merged_branch"]:
+                r["branch_merges"] = branch_index.get(r["merged_branch"], "")
 
     log.append(f"Done. Processed {len(file_names)} file name(s) -> {len(rows)} result row(s).")
     return rows, log
@@ -267,7 +271,7 @@ def api_run():
 
     try:
         rows, log = process(repo_path, branch, do_reset, file_names)
-    except Exception as e:  # noqa: BLE001 - surface setup errors (bad path, git failure) to the UI
+    except Exception as e:  # noqa: BLE001 - surface setup errors to the UI
         return jsonify({"error": str(e)}), 400
 
     return jsonify({"rows": rows, "log": log})
@@ -275,8 +279,7 @@ def api_run():
 
 @app.route("/api/download", methods=["POST"])
 def api_download():
-    """Takes the rows the browser already has and streams them back as
-    output.csv, matching the original script's output format exactly."""
+    """Streams the rows the browser already has back as output.csv."""
     data = request.get_json(force=True) or {}
     rows = data.get("rows") or []
 
@@ -294,4 +297,4 @@ def api_download():
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000)
+    app.run(debug=os.environ.get("FLASK_DEBUG") == "1", port=5000)
